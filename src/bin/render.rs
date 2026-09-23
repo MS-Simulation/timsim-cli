@@ -204,7 +204,7 @@ struct Args {
     /// mode the actual standard deviation is `mz·ppm/1e6/3` (ppm = 3σ), reproducing v1's
     /// `add_mz_noise_normal`. `0` = off (byte-identical to the noiseless render). Seeded per
     /// `(precursor_id, peak_index)` so adding an ion never reshuffles the others. See `REALISM_PLAN.md`
-    /// in the timsim-necro repo (github.com/theGreatHerrLebert/timsim-necro), where the noise plan lives.
+    /// in the timsim-necro repo (github.com/MS-Simulation/timsim-necro), where the noise plan lives.
     #[arg(long, default_value_t = 0.0)]
     noise_mz_ppm: f64,
     /// Noise A1 — m/z scatter on **fragment (MS2)** peaks (ppm envelope, v1 `fragment_noise_ppm`). `0` = off.

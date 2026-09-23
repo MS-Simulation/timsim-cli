@@ -1,7 +1,7 @@
 //! `timsim-render-bench` — the §7 streaming-render prototype and memory benchmark.
 //!
 //! It proves the central claim of `docs/v2-design/TIMSIM_V2_RENDER.md` (in the
-//! [timsim-necro](https://github.com/theGreatHerrLebert/timsim-necro) repo, which holds the v2 render
+//! [timsim-necro](https://github.com/MS-Simulation/timsim-necro) repo, which holds the v2 render
 //! design docs): that a sweep-line render's working set is
 //! bounded by the **elution window, not the run length**. It streams the Parquet feature space, drives
 //! the shared [`timsim_cli::render::stream_render`] sweep (the same code the oracle tests in

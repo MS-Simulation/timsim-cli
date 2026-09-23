@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "The timsim v2 protocol tools: proteome, digest, design, yield."
-repository = "https://github.com/theGreatHerrLebert/timsim-cli"
+repository = "https://github.com/MS-Simulation/timsim-cli"
 
 # Separate binaries, not `timsim <verb>`. Necroflow's cache identity can hash the binary, so
 # one binary per tool means changing the renderer does not invalidate your digest.

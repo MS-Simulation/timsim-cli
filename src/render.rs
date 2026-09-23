@@ -5,7 +5,7 @@
 //! active set (min-heap on `frame_end`), accumulates every active ion's contribution into a sparse
 //! per-frame `(scan, tof)` buffer, hands that buffer to a callback, and drops it. Its working set is
 //! bounded by the elution window, not the run length (see `docs/v2-design/TIMSIM_V2_RENDER.md` §7 in
-//! the [timsim-necro](https://github.com/theGreatHerrLebert/timsim-necro) repo — the v2 render design
+//! the [timsim-necro](https://github.com/MS-Simulation/timsim-necro) repo — the v2 render design
 //! docs live there, not here).
 //!
 //! # Why a second, independent render lives here
