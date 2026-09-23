@@ -1,7 +1,7 @@
 # THERMO_WRITER_PORT — robust MS1 FTMS-profile authoring in `thermorawfile`
 
 Status: DRAFT for claudex. Prerequisite for `THERMO_PLAN.md` M2 (the DIA render needs to author MS1
-precursor-survey profile scans). Target crate: `theGreatHerrLebert/thermorawfile` (rev 9e908ba here;
+precursor-survey profile scans). Target crate: `MS-Simulation/thermorawfile` (rev 9e908ba here;
 the writer is self-described WIP — "reader and, soon, writer").
 
 ## What we actually found (grounded, not assumed)

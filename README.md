@@ -97,15 +97,15 @@ count nor the size of the set changes any individual result.
 ## Driven by necroflow
 
 These binaries are designed to be run as content-addressed DAG nodes by
-[timsim-necro](https://github.com/theGreatHerrLebert/timsim-necro), which also holds the v2 design
+[timsim-necro](https://github.com/MS-Simulation/timsim-necro), which also holds the v2 design
 documents (`REALISM_PLAN.md`, `docs/v2-design/TIMSIM_V2_RENDER.md`, …). The design docs *in this repo*
 (`THERMO_PLAN.md`, `DDA_PLAN.md`, `SCIEX_CONSOLIDATION.md`, `NECROFLOW_WIRING.md`,
 `A2_REAL_DATA_NOISE.md`, `SPIKE_INTO_REAL.md`, `PARALLEL_RUN_DIA.md`, …) are the design record for
 work that has landed here.
 
 **Not in this repo:** `timsim-fragments`, `timsim-ccs` and `timsim-rt` are Python CLIs and live in
-[timsim-predict](https://github.com/theGreatHerrLebert/timsim-predict). Scoring lives in
-[timsim-eval](https://github.com/theGreatHerrLebert/timsim-eval).
+[timsim-predict](https://github.com/MS-Simulation/timsim-predict). Scoring lives in
+[timsim-eval](https://github.com/MS-Simulation/timsim-eval).
 
 ## License
 
