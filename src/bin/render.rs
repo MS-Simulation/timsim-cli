@@ -836,6 +836,11 @@ fn main() -> Result<()> {
     };
     if a.peak_shape.is_legacy() {
         legacy.validate()?;
+        // The model's mean anchoring is applied as a shift in frames (see below), which a one-frame
+        // run cannot express.
+        if a.n_frames < 2 {
+            return Err(anyhow!("--peak-shape per-peptide-legacy needs at least 2 frames (got {})", a.n_frames));
+        }
     }
     let mut rt: HashMap<u64, (f64, Elution)> = HashMap::new();
     let global_elution = Elution::global(a.sigma_frames, g.shape);
@@ -990,7 +995,7 @@ fn main() -> Result<()> {
     // Legacy model: anchor the Gaussian MEAN, not the mode, at the predicted RT, and use v1's trailing
     // per-frame window — both as one apex shift (see `legacy_anchor_shift_frames`). Applied here, on
     // the RT index, so every placement path (simple, DDA, DIA) inherits it unchanged.
-    if a.peak_shape.is_legacy() && a.n_frames > 1 {
+    if a.peak_shape.is_legacy() {
         let index_per_frame = span / (a.n_frames as f64 - 1.0);
         for (rt_index, e) in rt.values_mut() {
             *rt_index += timsim_cli::render::legacy_anchor_shift_frames(e) * index_per_frame;

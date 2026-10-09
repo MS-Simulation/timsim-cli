@@ -425,14 +425,15 @@ fn truncated_normal_above(u: f64, mean: f64, var: f64, lo: f64) -> Result<f64, P
     let alpha = (lo - mean) / sd;
     let phi_alpha = (-0.5 * alpha * alpha).exp() / (2.0 * std::f64::consts::PI).sqrt();
     let near = sd * u * s_lo / phi_alpha;
-    if phi_alpha > 0.0 && near < 1e-6 * sd {
-        return Ok(lo + near);
-    }
-    let s = (1.0 - u) * s_lo;
-    let x = mean - sd * std_normal_quantile(s);
+    let x = if phi_alpha > 0.0 && near < 1e-6 * sd {
+        lo + near
+    } else {
+        mean - sd * std_normal_quantile((1.0 - u) * s_lo)
+    };
     if !x.is_finite() {
         return Err(PeakShapeError::NotFinite { name: "legacy truncated-normal draw", value: x });
     }
+    // v1 accepts strictly above the bound; either branch can round onto it.
     Ok(if x > lo { x } else { f64::from_bits(lo.to_bits() + if lo >= 0.0 { 1 } else { u64::MAX }) })
 }
 
@@ -2246,6 +2247,9 @@ mod tests {
         assert!(tiny.is_finite() && tiny > 1e-20 && tiny < 1e-10, "{tiny}");
         // A truncation that leaves no mass is refused, not fabricated (v1 would never terminate).
         assert!(truncated_normal_above(0.5, -40.0, 1.0, 0.0).is_err());
+        // Strongly truncated, smallest draw: still strictly above the bound, as v1 requires.
+        let l = truncated_normal_above(0.5 / (1u64 << 52) as f64, -3.0, 0.01, LEGACY_LAMBDA_FLOOR);
+        assert!(l.map_or(true, |l| l > LEGACY_LAMBDA_FLOOR), "{l:?}");
     }
 
     #[test]
