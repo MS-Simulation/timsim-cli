@@ -86,8 +86,12 @@ for case in m["cases"]:
         for a in case["args"]:
             if skip_next:
                 skip_next = False; continue
-            if a == "--peak-shape" and not shape_flag:
-                skip_next = True; continue          # the parent binary has no such flag
+            # The parent binary lacks these flags, except --min-peak-intensity, which it defaults
+            # to 1; at their pinned values (gaussian, 0, 1, 1) the head renders what the parent
+            # renders without them.
+            if a in ("--peak-shape", "--mobility-std-target", "--min-peak-intensity",
+                     "--min-peak-intensity-ms2") and not shape_flag:
+                skip_next = True; continue
             if a.startswith("{") and a.endswith("}"):
                 key = a[1:-1]
                 args.append(out if key == "out" else fx[key])
