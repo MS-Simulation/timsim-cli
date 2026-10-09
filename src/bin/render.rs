@@ -137,6 +137,20 @@ struct Args {
     /// `k ~ 0 + Beta(1,20)*10`; see `imspy_simulation/timsim/simulator.py`).
     #[arg(long, default_value_t = timsim_cli::render::V1_DEFAULT_EMG_K)]
     emg_k: f64,
+    /// `--peak-shape per-peptide-legacy`: mean of v1's per-peptide RT sigma, seconds (v1
+    /// `mean_std_rt`). Defaults are imspy's own at rustims df2c9a0b; the deposited DIA-H01 runs
+    /// used 0.9 / 0.2 / 1.5 / 0.01. Ignored by every other shape.
+    #[arg(long, default_value_t = timsim_cli::render::LegacyRtModel::V1_DEFAULTS.sigma_mean)]
+    legacy_rt_sigma_mean: f64,
+    /// VARIANCE of that sigma (v1 `variance_std_rt`; v1 uses `scale = sqrt(variance)`).
+    #[arg(long, default_value_t = timsim_cli::render::LegacyRtModel::V1_DEFAULTS.sigma_var)]
+    legacy_rt_sigma_var: f64,
+    /// Mean of the EMG rate lambda, 1/s (v1 `mean_skewness` — a rate, despite the name).
+    #[arg(long, default_value_t = timsim_cli::render::LegacyRtModel::V1_DEFAULTS.lambda_mean)]
+    legacy_rt_lambda_mean: f64,
+    /// VARIANCE of lambda (v1 `variance_skewness`).
+    #[arg(long, default_value_t = timsim_cli::render::LegacyRtModel::V1_DEFAULTS.lambda_var)]
+    legacy_rt_lambda_var: f64,
     /// Simple-mode m/z and 1/K0 ranges + digitizer size (ignored in --reference-d mode).
     #[arg(long, default_value_t = 100.0)]
     mz_min: f64,
@@ -558,6 +572,11 @@ enum PeakShapeArg {
     /// into a plausible-but-different simulation, which is the failure this render's provenance
     /// exists to make visible.
     PerPeptide,
+    /// v1's ORIGINAL per-peptide EMG, the model before the Beta one above — what the deposited
+    /// TimSim DIA-H01 runs used. Width in seconds and EMG rate drawn per peptide from truncated
+    /// Normals (`--legacy-rt-*`), independent of the gradient, keyed on the peptide id. Does not
+    /// read `rt_sigma_hat` / `rt_k_hat`. See `timsim_cli::render::LegacyRtModel`.
+    PerPeptideLegacy,
 }
 
 impl PeakShapeArg {
@@ -570,12 +589,18 @@ impl PeakShapeArg {
             // The run-wide fallback for the per-peptide mode: used only where a peptide has no draw
             // (the non-Bruker writers, which do not read `peptide_rt`). Per-peptide ions carry their
             // own shape and never consult this one.
-            PeakShapeArg::PerPeptide => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
+            PeakShapeArg::PerPeptide | PeakShapeArg::PerPeptideLegacy => {
+                timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?
+            }
         })
     }
 
     fn is_per_peptide(self) -> bool {
         matches!(self, PeakShapeArg::PerPeptide)
+    }
+
+    fn is_legacy(self) -> bool {
+        matches!(self, PeakShapeArg::PerPeptideLegacy)
     }
 }
 
@@ -803,6 +828,15 @@ fn main() -> Result<()> {
     // for a 1860.0 s gradient while acquiring over 1861.3 s. Worth 0.00027 s of sigma, i.e. nothing
     // numerically, but it is a difference in kind and is recorded as such rather than as parity.
     let gradient_seconds = a.n_frames as f64 * a.cycle_seconds;
+    let legacy = timsim_cli::render::LegacyRtModel {
+        sigma_mean: a.legacy_rt_sigma_mean,
+        sigma_var: a.legacy_rt_sigma_var,
+        lambda_mean: a.legacy_rt_lambda_mean,
+        lambda_var: a.legacy_rt_lambda_var,
+    };
+    if a.peak_shape.is_legacy() {
+        legacy.validate()?;
+    }
     let mut rt: HashMap<u64, (f64, Elution)> = HashMap::new();
     let global_elution = Elution::global(a.sigma_frames, g.shape);
     let mut realized = timsim_cli::provenance::RealizedBuilder::default();
@@ -855,6 +889,15 @@ fn main() -> Result<()> {
                     // descriptor while disagreeing with what was rendered.
                     Elution { sigma_frames: sf, shape }
                 }
+                None if a.peak_shape.is_legacy() => {
+                    let pid = id.value(i);
+                    let (sf, shape) = timsim_cli::render::legacy_rt_shape_for_peptide(
+                        open01(pid, LEGACY_SALT_SIGMA), open01(pid, LEGACY_SALT_LAMBDA),
+                        &legacy, a.cycle_seconds, a.n_sigma,
+                    )
+                    .map_err(|err| anyhow!("peptide {pid}: {err}"))?;
+                    Elution { sigma_frames: sf, shape }
+                }
                 None => global_elution,
             };
             // A duplicate id would OVERWRITE, so only the last row's shape would render while the
@@ -897,6 +940,31 @@ fn main() -> Result<()> {
             cycle_seconds: a.cycle_seconds,
             sigma_band_seconds: (lo_s, hi_s),
             k_upper: timsim_cli::render::V1_K_UPPER,
+            realized,
+            mobility: (a.mobility_std_target > 0.0)
+                .then_some((a.mobility_std_target, timsim_cli::render::CCS_STD_MODEL_REFERENCE)),
+        }
+    } else if a.peak_shape.is_legacy() {
+        for (pid, (_, e)) in rt.iter() {
+            realized.push(*pid, e.sigma_frames, &e.shape);
+        }
+        let realized = realized.finish();
+        let mut widths: Vec<f64> = rt.values().map(|(_, e)| e.sigma_frames * a.cycle_seconds).collect();
+        widths.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        eprintln!(
+            "  elution = per-peptide LEGACY (v1 pre-Beta): sigma ~ truncnormal({}, var {}) s, lambda ~ \
+             truncnormal({}, var {}) 1/s, gradient-independent; {} peptides shaped",
+            legacy.sigma_mean, legacy.sigma_var, legacy.lambda_mean, legacy.lambda_var, realized.n_shaped,
+        );
+        if let (Some(&w0), Some(&w1)) = (widths.first(), widths.last()) {
+            eprintln!("  realized sigma: {:.3} .. {:.3} s (median {:.3} s); emg k {:.3} .. {:.3} (mean {:.3})",
+                w0, w1, widths[widths.len() / 2], realized.emg_k_min, realized.emg_k_max, realized.emg_k_mean);
+        }
+        eprintln!("  realized shape digest: {}", realized.digest);
+        timsim_cli::provenance::ElutionProvenance::PerPeptideLegacy {
+            n_sigma: a.n_sigma,
+            cycle_seconds: a.cycle_seconds,
+            model: legacy,
             realized,
             mobility: (a.mobility_std_target > 0.0)
                 .then_some((a.mobility_std_target, timsim_cli::render::CCS_STD_MODEL_REFERENCE)),
@@ -1599,6 +1667,17 @@ fn splitmix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// Salts for the legacy RT model's two per-peptide draws (independent streams of one peptide id).
+const LEGACY_SALT_SIGMA: u64 = 0x6C65_6761_6379_5F73; // "legacy_s"
+const LEGACY_SALT_LAMBDA: u64 = 0x6C65_6761_6379_5F6C; // "legacy_l"
+
+/// Deterministic `(id, salt) -> (0, 1)`, OPEN at both ends (bin midpoints), for inverse-CDF draws
+/// that must never hit a bound. The salt is folded in through an avalanche, not added, so the two
+/// streams of one id are independent.
+fn open01(id: u64, salt: u64) -> f64 {
+    ((splitmix64(splitmix64(id) ^ salt) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
 }
 
 /// Deterministic `u64 -> [0, 1)`. Identity-keyed randomness: the same id always maps to the same value, so
