@@ -987,6 +987,15 @@ fn main() -> Result<()> {
     let lo = parse("timsim.rt.index_min")?;
     let hi = parse("timsim.rt.index_max")?;
     let span = (hi - lo).max(1e-9);
+    // Legacy model: anchor the Gaussian MEAN, not the mode, at the predicted RT, and use v1's trailing
+    // per-frame window — both as one apex shift (see `legacy_anchor_shift_frames`). Applied here, on
+    // the RT index, so every placement path (simple, DDA, DIA) inherits it unchanged.
+    if a.peak_shape.is_legacy() && a.n_frames > 1 {
+        let index_per_frame = span / (a.n_frames as f64 - 1.0);
+        for (rt_index, e) in rt.values_mut() {
+            *rt_index += timsim_cli::render::legacy_anchor_shift_frames(e) * index_per_frame;
+        }
+    }
 
     if a.dda {
         return run_dda(&a, &p, &g, &rt, lo, span, &prov, &mob, &jitter);
@@ -1677,7 +1686,9 @@ const LEGACY_SALT_LAMBDA: u64 = 0x6C65_6761_6379_5F6C; // "legacy_l"
 /// that must never hit a bound. The salt is folded in through an avalanche, not added, so the two
 /// streams of one id are independent.
 fn open01(id: u64, salt: u64) -> f64 {
-    ((splitmix64(splitmix64(id) ^ salt) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    // 52 bits, not 53: (2^53 - 1) + 0.5 is not representable and rounds to 2^53, i.e. exactly 1.0.
+    // With 52 bits the top value (2^52 - 0.5) / 2^52 = 1 - 2^-53 is exact.
+    ((splitmix64(splitmix64(id) ^ salt) >> 12) as f64 + 0.5) / (1u64 << 52) as f64
 }
 
 /// Deterministic `u64 -> [0, 1)`. Identity-keyed randomness: the same id always maps to the same value, so

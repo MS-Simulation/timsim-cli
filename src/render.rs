@@ -403,17 +403,37 @@ fn std_normal_quantile(p: f64) -> f64 {
 /// `Normal(mean, var)` truncated to `(lo, inf)`, at quantile `u` in (0, 1) — what v1's
 /// redraw-until-above-`lo` loop samples. Computed in the upper tail so a strongly truncated case
 /// (mean far below `lo`) keeps its precision.
-fn truncated_normal_above(u: f64, mean: f64, var: f64, lo: f64) -> f64 {
+///
+/// Refuses a truncation that leaves no representable mass (v1 would loop forever there) rather
+/// than returning a fabricated value. A draw that rounds onto the excluded bound itself is moved to
+/// the next representable number above it, which is what "just above the bound" means in f64.
+fn truncated_normal_above(u: f64, mean: f64, var: f64, lo: f64) -> Result<f64, PeakShapeError> {
     if var == 0.0 {
-        return mean;
+        return Ok(mean);
     }
     let sd = var.sqrt();
     // Survival mass above the bound, S(alpha) = 1 - Phi(alpha); draw within it from the top.
     let s_lo = std_normal_cdf(-(lo - mean) / sd);
+    if !(s_lo > 1e-280) {
+        return Err(PeakShapeError::NotPositive {
+            name: "legacy truncated-normal mass above the bound (mean too far below it)",
+            value: s_lo,
+        });
+    }
+    // Close to the bound (small u) the quantile's ~1e-9 absolute error would swamp the true distance
+    // to the bound, so use the exact first-order expansion of S there: x - lo = sd * u * S(alpha) / phi(alpha).
+    let alpha = (lo - mean) / sd;
+    let phi_alpha = (-0.5 * alpha * alpha).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let near = sd * u * s_lo / phi_alpha;
+    if phi_alpha > 0.0 && near < 1e-6 * sd {
+        return Ok(lo + near);
+    }
     let s = (1.0 - u) * s_lo;
     let x = mean - sd * std_normal_quantile(s);
-    // Rounding at the extreme low end cannot be allowed to return the excluded bound itself.
-    if x > lo { x } else { lo + f64::EPSILON * lo.abs().max(1.0) }
+    if !x.is_finite() {
+        return Err(PeakShapeError::NotFinite { name: "legacy truncated-normal draw", value: x });
+    }
+    Ok(if x > lo { x } else { f64::from_bits(lo.to_bits() + if lo >= 0.0 { 1 } else { u64::MAX }) })
 }
 
 /// [`LegacyRtModel`] for one peptide: `(sigma_frames, shape)`, from two independent unit draws
@@ -441,10 +461,31 @@ pub fn legacy_rt_shape_for_peptide(
     if cycle_seconds <= 0.0 {
         return Err(PeakShapeError::NotPositive { name: "cycle-seconds", value: cycle_seconds });
     }
-    let sigma_s = truncated_normal_above(u_sigma, model.sigma_mean, model.sigma_var, 0.0);
-    let lambda = truncated_normal_above(u_lambda, model.lambda_mean, model.lambda_var, LEGACY_LAMBDA_FLOOR);
-    let shape = PeakShape::emg(1.0 / (sigma_s * lambda), n_sigma)?;
-    Ok((sigma_s / cycle_seconds, shape))
+    let sigma_s = truncated_normal_above(u_sigma, model.sigma_mean, model.sigma_var, 0.0)?;
+    let lambda = truncated_normal_above(u_lambda, model.lambda_mean, model.lambda_var, LEGACY_LAMBDA_FLOOR)?;
+    let k = 1.0 / (sigma_s * lambda);
+    // `PeakShape::emg` collapses an extreme k to the Gaussian. For this model that would delete a
+    // real exponential tail (a near-zero sigma with an ordinary lambda is mostly tail), so refuse.
+    match PeakShape::emg(k, n_sigma)? {
+        PeakShape::Gaussian => Err(PeakShapeError::DegeneratesToGaussian { value: k }),
+        shape => Ok((sigma_s / cycle_seconds, shape)),
+    }
+}
+
+/// Where to put a legacy peak's apex, in frames, relative to the frame the RT predictor maps to.
+///
+/// The render anchors every EMG at its MODE (`Emg::mode_offset` — the later v1's
+/// `estimate_mu_from_mode_emg`). The ORIGINAL v1 model this mode reproduces anchored the Gaussian
+/// MEAN `mu` at the predicted RT instead (rustims df2c9a0b), so its apex sits `sigma * mode_offset`
+/// later. And it integrated frame `f` over `[t_f - period, t_f]`, a trailing window, where the render
+/// integrates the centred `[f - 0.5, f + 0.5]`; the same masses need the apex half a frame later.
+/// Adding this shift to the predicted apex makes every frame receive v1's mass.
+pub fn legacy_anchor_shift_frames(e: &Elution) -> f64 {
+    let mode = match e.shape {
+        PeakShape::Emg(em) => em.mode_offset(),
+        PeakShape::Gaussian => 0.0,
+    };
+    e.sigma_frames * mode + 0.5
 }
 
 /// Map a peptide's unit draws onto this run: `(sigma_frames, k)`.
@@ -2176,8 +2217,8 @@ mod tests {
         let n = 200_000;
         let grid = |f: &dyn Fn(f64) -> f64| (0..n).map(|i| f((i as f64 + 0.5) / n as f64)).sum::<f64>() / n as f64;
         let m = &DIA_H01;
-        let sigma_mean = grid(&|u| truncated_normal_above(u, m.sigma_mean, m.sigma_var, 0.0));
-        let lambda_mean = grid(&|u| truncated_normal_above(u, m.lambda_mean, m.lambda_var, LEGACY_LAMBDA_FLOOR));
+        let sigma_mean = grid(&|u| truncated_normal_above(u, m.sigma_mean, m.sigma_var, 0.0).unwrap());
+        let lambda_mean = grid(&|u| truncated_normal_above(u, m.lambda_mean, m.lambda_var, LEGACY_LAMBDA_FLOOR).unwrap());
         let want_sigma = truncated_mean(m.sigma_mean, m.sigma_var, 0.0);
         let want_lambda = truncated_mean(m.lambda_mean, m.lambda_var, LEGACY_LAMBDA_FLOOR);
         assert!((sigma_mean - want_sigma).abs() < 1e-4, "sigma mean {sigma_mean} vs {want_sigma}");
@@ -2193,22 +2234,26 @@ mod tests {
         let mut prev = (0.0, 0.0);
         for i in 1..1000 {
             let u = i as f64 / 1000.0;
-            let s = truncated_normal_above(u, m.sigma_mean, m.sigma_var, 0.0);
-            let l = truncated_normal_above(u, m.lambda_mean, m.lambda_var, LEGACY_LAMBDA_FLOOR);
+            let s = truncated_normal_above(u, m.sigma_mean, m.sigma_var, 0.0).unwrap();
+            let l = truncated_normal_above(u, m.lambda_mean, m.lambda_var, LEGACY_LAMBDA_FLOOR).unwrap();
             assert!(s > 0.0 && l > LEGACY_LAMBDA_FLOOR, "u {u}: sigma {s} lambda {l}");
             assert!(s > prev.0 && l > prev.1, "not increasing at u {u}");
             prev = (s, l);
         }
-        // Extreme quantiles stay strictly above the bound.
-        assert!(truncated_normal_above(1e-300, m.sigma_mean, m.sigma_var, 0.0) > 0.0);
+        // The smallest draw the renderer can ask for (open01's lowest value, 2^-53 scale) is a real,
+        // finite width well above the bound — not the bound, and not a fallback constant.
+        let tiny = truncated_normal_above(0.5 / (1u64 << 52) as f64, m.sigma_mean, m.sigma_var, 0.0).unwrap();
+        assert!(tiny.is_finite() && tiny > 1e-20 && tiny < 1e-10, "{tiny}");
+        // A truncation that leaves no mass is refused, not fabricated (v1 would never terminate).
+        assert!(truncated_normal_above(0.5, -40.0, 1.0, 0.0).is_err());
     }
 
     #[test]
     fn legacy_shape_is_v1s_emg_in_frames() {
         let cycle = 0.105445744;
         let (sf, shape) = legacy_rt_shape_for_peptide(0.3, 0.7, &DIA_H01, cycle, 3.0).unwrap();
-        let sigma_s = truncated_normal_above(0.3, 0.9, 0.2, 0.0);
-        let lambda = truncated_normal_above(0.7, 1.5, 0.01, LEGACY_LAMBDA_FLOOR);
+        let sigma_s = truncated_normal_above(0.3, 0.9, 0.2, 0.0).unwrap();
+        let lambda = truncated_normal_above(0.7, 1.5, 0.01, LEGACY_LAMBDA_FLOOR).unwrap();
         assert!((sf - sigma_s / cycle).abs() < 1e-12);
         match shape {
             PeakShape::Emg(e) => assert!((e.k() - 1.0 / (sigma_s * lambda)).abs() < 1e-12),
@@ -2241,5 +2286,40 @@ mod tests {
             assert!(legacy_rt_shape_for_peptide(0.5, 0.5, &DIA_H01, cyc, 3.0).is_err(), "cycle {cyc}");
         }
         assert!(LegacyRtModel::V1_DEFAULTS.validate().is_ok());
+    }
+
+    /// The decisive check of the anchor shift: with it, every frame receives exactly the mass v1
+    /// gave it — v1's EMG with `mu` at the predicted position, integrated over v1's trailing window
+    /// `[f - 1, f]` (frame units) — for a typical, a narrow and a tail-heavy peptide.
+    #[test]
+    fn legacy_anchor_reproduces_v1_frame_masses() {
+        let cycle = 0.105445744;
+        for (u_s, u_l) in [(0.5, 0.5), (0.05, 0.9), (0.97, 0.02)] {
+            let (sf, shape) = legacy_rt_shape_for_peptide(u_s, u_l, &DIA_H01, cycle, 6.0).unwrap();
+            let e = Elution { sigma_frames: sf, shape };
+            let k = match shape { PeakShape::Emg(em) => em.k(), _ => panic!("EMG expected") };
+            let mu = 500.0; // v1: the predicted RT, in frames
+            let apex = mu + legacy_anchor_shift_frames(&e);
+            // v1's mass for frame f: integral of EMG(mu, sf, lambda = 1/(k sf)) over [f-1, f].
+            let v1_mass = |f: f64| {
+                let n = 4000;
+                let (a, b) = (f - 1.0, f);
+                let h = (b - a) / n as f64;
+                (0..=n).map(|i| {
+                    let x = a + i as f64 * h;
+                    let w = if i == 0 || i == n { 0.5 } else { 1.0 };
+                    // emg_pdf_std drops v1's lambda/2 prefactor (only its argmax/height is used in
+                    // the render); in z units lambda = 1/k, so the normalised density is 1/(2k) times it.
+                    w * emg_pdf_std((x - mu) / sf, k) / (2.0 * k) / sf
+                }).sum::<f64>() * h
+            };
+            let mut worst: f64 = 0.0;
+            for f in 480..560 {
+                let f = f as f64;
+                let got = e.frac(f - 0.5, f + 0.5, apex);
+                worst = worst.max((got - v1_mass(f)).abs());
+            }
+            assert!(worst < 2e-4, "u=({u_s},{u_l}) sigma_frames {sf:.3} k {k:.3}: max |mass diff| {worst:.2e}");
+        }
     }
 }
