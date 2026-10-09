@@ -18,7 +18,8 @@
     "Fixture paths are machine-local; the test SKIPS (loudly) a case whose inputs are absent, and",
     "FAILS if that leaves nothing to check.",
     "",
-    "Cases pin BOTH --peak-shape gaussian AND --mobility-std-target 0: the first turns off the per-peptide elution shape, the second the per-ion mobility width. Both are needed to reproduce the pre-EMG binary, because per-ion mobility changes the rendered SIGNAL (analysis.tdf_bin), not just metadata -- the only change in this line of work that does."
+    "Cases pin BOTH --peak-shape gaussian AND --mobility-std-target 0: the first turns off the per-peptide elution shape, the second the per-ion mobility width. Both are needed to reproduce the pre-EMG binary, because per-ion mobility changes the rendered SIGNAL (analysis.tdf_bin), not just metadata -- the only change in this line of work that does.",
+    "The thermo case also pins --min-peak-intensity 1 and --min-peak-intensity-ms2 1: since 1f4a949 (2026-08-29) render_thermo defaults to inheriting the template's per-level reporting floor, and the pre-EMG parent used a fixed floor of 1. Unpinned, the new default moved the .raw hash although the Gaussian path did not change."
   ],
   "parent_commit": "52e6c91",
   "head_flag": "--peak-shape gaussian",
@@ -284,7 +285,11 @@
         "--thermo-truth",
         "{out}/truth.parquet",
         "--peak-shape",
-        "gaussian"
+        "gaussian",
+        "--min-peak-intensity",
+        "1",
+        "--min-peak-intensity-ms2",
+        "1"
       ],
       "needs": [
         "precursors",

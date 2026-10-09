@@ -2930,9 +2930,9 @@ checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
 
 [[package]]
 name = "thermorawfile"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb7f5a341ed7fd4ba5cd6e1121cbdd0377483bf5435c0938b38f43c5a416d21e"
+checksum = "880bf552a8f16f4a4ac95811c7918e95fa198768b3ec34bbc3edb50cd796340a"
 
 [[package]]
 name = "thiserror"
