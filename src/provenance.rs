@@ -218,7 +218,22 @@ pub enum ElutionProvenance {
         /// per-ion widths are off and every ion used the flat `--sigma-scans`.
         mobility: Option<(f64, f64)>,
     },
+    /// v1's ORIGINAL model ([`crate::render::LegacyRtModel`]): width in seconds and EMG rate drawn
+    /// per peptide from truncated Normals, independent of the gradient. Like `PerPeptide`, it has
+    /// no single kernel and writes no `emg_k`.
+    PerPeptideLegacy {
+        n_sigma: f64,
+        cycle_seconds: f64,
+        model: crate::render::LegacyRtModel,
+        realized: Realized,
+        mobility: Option<(f64, f64)>,
+    },
 }
+
+/// Identity key of the legacy model's draws: two salted splitmix64 streams of the peptide id.
+pub const LEGACY_IDENTITY_KEY: &str = "splitmix64/peptide_id#legacy_sigma|legacy_lambda";
+/// Model tag for the legacy elution record.
+pub const LEGACY_ELUTION_MODEL_VERSION: &str = "timsim-elution-v1-legacy/1";
 
 impl ElutionProvenance {
     /// The value written to `peak_shape` / `SimPeakShape`.
@@ -226,6 +241,7 @@ impl ElutionProvenance {
         match self {
             ElutionProvenance::Global { shape, .. } => shape.name(),
             ElutionProvenance::PerPeptide { .. } => "per-peptide",
+            ElutionProvenance::PerPeptideLegacy { .. } => "per-peptide-legacy",
         }
     }
 
@@ -254,6 +270,32 @@ impl ElutionProvenance {
                 v.push((KEY_SIGMA_BAND.to_string(), format!(
                     "[{},{}]", f64_str(sigma_band_seconds.0), f64_str(sigma_band_seconds.1))));
                 v.push((KEY_K_UPPER.to_string(), f64_str(*k_upper)));
+                v.push((KEY_REALIZED_DIGEST.to_string(), realized.digest.clone()));
+                v.push((KEY_N_SHAPED.to_string(), realized.n_shaped.to_string()));
+                v.push((KEY_N_COLLAPSED.to_string(), realized.n_gaussian_collapsed.to_string()));
+                v.push((KEY_SIGMA_STATS.to_string(), format!("{}/{}/{}",
+                    f64_str(realized.sigma_frames_min), f64_str(realized.sigma_frames_mean), f64_str(realized.sigma_frames_max))));
+                v.push((KEY_MOBILITY.to_string(), match mobility {
+                    Some((t, r)) => format!("per-ion/ccs_std target={} reference={} gain={}",
+                        f64_str(*t), f64_str(*r), f64_str(t / r)),
+                    None => "flat/sigma-scans".to_string(),
+                }));
+                v.push((KEY_K_STATS.to_string(), format!("{}/{}/{}",
+                    f64_str(realized.emg_k_min), f64_str(realized.emg_k_mean), f64_str(realized.emg_k_max))));
+            }
+            ElutionProvenance::PerPeptideLegacy { n_sigma, cycle_seconds, model, realized, mobility } => {
+                v.push((KEY_N_SIGMA.to_string(), f64_str(*n_sigma)));
+                v.push((KEY_SCHEMA_VERSION.to_string(), PROVENANCE_SCHEMA_VERSION.to_string()));
+                v.push((KEY_MODEL_VERSION.to_string(), LEGACY_ELUTION_MODEL_VERSION.to_string()));
+                v.push((KEY_IDENTITY_KEY.to_string(), LEGACY_IDENTITY_KEY.to_string()));
+                v.push((KEY_SIGMA_LAW.to_string(), "fixed-seconds/v1-legacy".to_string()));
+                v.push((KEY_SIGMA_HAT_DIST.to_string(), format!("truncnormal(mean={},var={},lo=0)",
+                    f64_str(model.sigma_mean), f64_str(model.sigma_var))));
+                v.push((KEY_K_HAT_DIST.to_string(), format!(
+                    "k=1/(sigma*lambda),lambda~truncnormal(mean={},var={},lo={})",
+                    f64_str(model.lambda_mean), f64_str(model.lambda_var),
+                    f64_str(crate::render::LEGACY_LAMBDA_FLOOR))));
+                v.push((KEY_CYCLE_SECONDS.to_string(), f64_str(*cycle_seconds)));
                 v.push((KEY_REALIZED_DIGEST.to_string(), realized.digest.clone()));
                 v.push((KEY_N_SHAPED.to_string(), realized.n_shaped.to_string()));
                 v.push((KEY_N_COLLAPSED.to_string(), realized.n_gaussian_collapsed.to_string()));
@@ -421,7 +463,7 @@ pub fn parse_shape(name: &str, k: &str, n_sigma: &str) -> Result<PeakShape, Prov
         // and any value handed back — the mean, the mode, the first peptide's — would be a kernel no
         // peak in the run actually had, presented as if it were the run's. That is the exact defect
         // this module exists to prevent, and it would be introduced BY the module.
-        "per-peptide" => Err(ProvenanceError::NotASingleShape),
+        "per-peptide" | "per-peptide-legacy" => Err(ProvenanceError::NotASingleShape),
         _ => Err(ProvenanceError::Malformed { key: KEY_PEAK_SHAPE, value: name.to_string() }),
     }
 }
@@ -504,6 +546,27 @@ mod tests {
             realized: realized(rows),
             mobility: Some((0.009, 0.009197)),
         }
+    }
+
+    #[test]
+    fn a_legacy_run_records_its_model_and_has_no_single_shape() {
+        let p = ElutionProvenance::PerPeptideLegacy {
+            n_sigma: 3.0,
+            cycle_seconds: 0.105445749226364,
+            model: crate::render::LegacyRtModel { sigma_mean: 0.9, sigma_var: 0.2, lambda_mean: 1.5, lambda_var: 0.01 },
+            realized: realized(&[(1, 8.5, 0.74), (2, 9.1, 0.69)]),
+            mobility: None,
+        };
+        let m: HashMap<String, String> = p.pairs().into_iter().collect();
+        assert_eq!(m[KEY_PEAK_SHAPE], "per-peptide-legacy");
+        assert!(!m.contains_key(KEY_EMG_K), "a per-peptide run must not write a single emg_k");
+        assert!(!m.contains_key(KEY_GRADIENT_SECONDS), "the legacy widths do not depend on the gradient");
+        assert_eq!(m[KEY_SIGMA_HAT_DIST], "truncnormal(mean=0.9,var=0.2,lo=0)");
+        assert_eq!(m[KEY_K_HAT_DIST], "k=1/(sigma*lambda),lambda~truncnormal(mean=1.5,var=0.01,lo=0.01)");
+        assert_eq!(m[KEY_MODEL_VERSION], LEGACY_ELUTION_MODEL_VERSION);
+        assert_eq!(parse_shape("per-peptide-legacy", "0.5", "3.0"), Err(ProvenanceError::NotASingleShape));
+        // The Bruker spelling stays collision-free with the extra record.
+        assert_eq!(p.tdf_pairs().len(), p.pairs().len());
     }
 
     /// **A per-peptide run must NOT answer "what was the run's kernel?"** — it has no such thing.
