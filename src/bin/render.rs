@@ -175,6 +175,15 @@ struct Args {
     cycle_seconds: f64,
     #[arg(long, default_value_t = 100_000.0)]
     intensity_scale: f64,
+    /// DIA only: multiply every FRAGMENT (MS2) peak by this factor before quantisation. `1` (the
+    /// DEFAULT) keeps the render byte-identical: each fragment spectrum stays unit-total, so MS2
+    /// conserves the precursor's ions. v1 instead scaled max-normalised Prosit intensities (top
+    /// fragment = 1, half the peaks kept by `down_sample_factor`), which puts several times more total
+    /// signal into MS2 than into MS1. Reproducing a v1 dataset therefore needs a gain > 1, calibrated
+    /// on simulated signal (MS2 excess over background), never on search results. Precursor bleed
+    /// from `--precursor-survival-*` is MS1 signal and is not scaled.
+    #[arg(long, default_value_t = 1.0)]
+    ms2_gain: f64,
     /// Drop quantised (scan, tof) bins whose intensity is below this floor. Emulates a peak-picking
     /// cutoff: without it, the 2-D Gaussian spread emits a haze of intensity-1 bins that dominate the
     /// peak count and drown the chromatographic shape in quantisation noise. `1` keeps every non-zero
@@ -608,6 +617,17 @@ fn main() -> Result<()> {
     let mut a = Args::parse();
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
+    }
+    // Bounded above so the f32 product in `apply_ms2_gain` cannot overflow: fragment spectra are
+    // unit-total, so every peak is <= 1 and 1000 x 1 is far inside f32. v1's MS2/MS1 ratio is a
+    // single-digit factor; a gain anywhere near the bound is a typo, not a calibration.
+    if !(a.ms2_gain.is_finite() && a.ms2_gain > 0.0 && a.ms2_gain <= MS2_GAIN_MAX) {
+        return Err(anyhow!("--ms2-gain must be finite and in (0, {MS2_GAIN_MAX}], got {}", a.ms2_gain));
+    }
+    if a.ms2_gain != 1.0 && !(a.dia && !a.dda) {
+        // Only the DIA projector applies it, and --dda wins when both flags are given; accepting it
+        // anywhere else would silently do nothing.
+        return Err(anyhow!("--ms2-gain is implemented for --dia (without --dda) only, got {}", a.ms2_gain));
     }
     // The elution knobs, policed identically in all four renderers (`timsim-render`, `-bench`,
     // `-thermo`, `-sciex`) by the one shared validator. Both sigmas are checked: `sigma_scans` feeds
@@ -1376,6 +1396,20 @@ fn dedup_and_quantise_into(
         scans.push(scan);
         tofs.push(tof);
         ints.push(q);
+    }
+}
+
+/// Upper bound of `--ms2-gain` (see the validation in `main`).
+const MS2_GAIN_MAX: f64 = 1000.0;
+
+/// `--ms2-gain` on one projected peak: fragment peaks are multiplied, precursor (MS1) peaks never are.
+/// Gain 1 returns the input untouched rather than round-tripping it through f64, so the default render
+/// stays bit-exact (pinned end to end by `tests/golden_gaussian.rs`).
+fn apply_ms2_gain(inten: f32, is_frag: bool, gain: f64) -> f32 {
+    if is_frag && gain != 1.0 {
+        (inten as f64 * gain) as f32
+    } else {
+        inten
     }
 }
 
@@ -2292,6 +2326,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 if m < p.mz_min || m > p.mz_max {
                     None
                 } else {
+                    let inten = apply_ms2_gain(inten, is_frag, a.ms2_gain);
                     Some(((p.to_tof)(m).min(p.tof_max.saturating_sub(1)), inten))
                 }
             })
@@ -3252,6 +3287,18 @@ mod noise_tests {
 
     // A2: the seeded per-peak keep decision must keep ≈ take_probability of peaks (v1's
     // generate_random_sample, made deterministic). Uses the same base/keep formula as build_frame_noise.
+    #[test]
+    fn ms2_gain_scales_fragments_only_and_is_identity_at_one() {
+        use super::apply_ms2_gain;
+        for &x in &[0.0f32, 1e-30, 0.1, 0.3333333, 1.0, 12345.678, f32::MAX / 4.0] {
+            assert_eq!(apply_ms2_gain(x, true, 1.0).to_bits(), x.to_bits(), "gain 1 must be bit-exact");
+            assert_eq!(apply_ms2_gain(x, false, 1.0).to_bits(), x.to_bits());
+            assert_eq!(apply_ms2_gain(x, false, 3.0).to_bits(), x.to_bits(), "MS1 peaks are never scaled");
+            assert_eq!(apply_ms2_gain(x, true, 2.0), x * 2.0);
+        }
+        assert_eq!(apply_ms2_gain(0.25, true, 0.5), 0.125);
+    }
+
     #[test]
     fn a2_downsample_keeps_take_probability() {
         use super::{a2_state, splitmix64};
