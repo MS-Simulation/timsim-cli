@@ -60,9 +60,15 @@ struct Args {
 
     /// `site-specific` (default — gas-phase basicity R > K > H; a clean tryptic peptide comes out
     /// 88.7% doubly charged) or `binomial` (v1 parity — every basic site equal, which calls a third
-    /// of all clean tryptic peptides singly-charged, and is kept only for comparison).
+    /// of all clean tryptic peptides singly-charged, and is kept only for comparison), or
+    /// `empirical` (resample each peptide's charge-share vector from `--charge-table`; see
+    /// `timsim_cli::charge_table` — how a published v1 dataset's charge mix is reproduced).
     #[arg(long, default_value = "site-specific")]
     charge_model: String,
+    /// `empirical` only: the reference table (TSV `n_kr n_h length f1 f2 f3 f4`). Required with
+    /// `--charge-model empirical`, refused otherwise.
+    #[arg(long)]
+    charge_table: Option<PathBuf>,
     /// Probability that any one protonatable site (N-term, H, R, K) carries a proton. `binomial` only.
     #[arg(long, default_value_t = 0.8)]
     charged_probability: f64,
@@ -155,8 +161,37 @@ fn main() -> Result<()> {
             charged_probability: a.charged_probability,
             max_charge: a.max_charge,
         },
-        "site-specific" => ChargeModel::realistic_with(a.max_charge),
-        other => anyhow::bail!("unknown charge model {other:?}; use 'binomial' or 'site-specific'"),
+        // `empirical` still runs the site-specific model, but only as the template that fixes each
+        // modform's mass and identity; its charge states are replaced from the table below.
+        "site-specific" | "empirical" => ChargeModel::realistic_with(a.max_charge),
+        other => anyhow::bail!("unknown charge model {other:?}; use 'binomial', 'site-specific' or 'empirical'"),
+    };
+    let table = match (a.charge_model.as_str(), &a.charge_table) {
+        ("empirical", Some(path)) => Some(timsim_cli::charge_table::ChargeTable::load(path)?),
+        ("empirical", None) => anyhow::bail!("--charge-model empirical needs --charge-table"),
+        (_, Some(_)) => anyhow::bail!("--charge-table is only used by --charge-model empirical"),
+        (_, None) => None,
+    };
+    // Per-peptide charge override + which fallback level served it (counted for the report).
+    let level_counts: [std::sync::atomic::AtomicUsize; 4] = Default::default();
+    // Share mass the donor carried above --max-charge, summed over lookups (f64 bits in a mutex-free
+    // accumulator would need CAS; a Mutex is simpler and this is not hot).
+    let empirical_cap_loss = std::sync::Mutex::new((0.0f64, 0usize));
+    let empirical = |ps: Vec<timsim_chem::Precursor>, seq: &str| -> Vec<timsim_chem::Precursor> {
+        match &table {
+            None => ps,
+            Some(t) => {
+                let (sh, level) = t.shares(seq, a.seed);
+                level_counts[level].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lost: f64 = sh.iter().skip(a.max_charge as usize).map(|&f| f as f64).sum();
+                if lost > 0.0 {
+                    let mut g = empirical_cap_loss.lock().unwrap();
+                    g.0 += lost;
+                    g.1 += 1;
+                }
+                timsim_cli::charge_table::with_shares(ps, &sh, a.max_charge)
+            }
+        }
     };
     let io = Ionizer {
         charge,
@@ -168,6 +203,18 @@ fn main() -> Result<()> {
 
     if a.explain {
         // Printed FROM the model, not from a hand-typed string that can drift away from it.
+        if let Some(t) = &table {
+            println!("  charge model     : empirical — {} reference peptides from {}", t.len(),
+                     a.charge_table.as_ref().unwrap().display());
+            println!("                     each peptide takes the charge-share vector of a reference");
+            println!("                     peptide in its (K+R, H, length) cell, drawn by an identity-");
+            println!("                     keyed hash of (sequence, seed); empty cells fall back to");
+            println!("                     (K+R, H), then K+R, then the whole table");
+            println!("                     shares are the reference's own and may sum to < 1 (states");
+            println!("                     the reference cut are absent); states above z = {} are dropped", a.max_charge);
+            println!("  flyability       : {}", a.flyability);
+            return Ok(());
+        }
         println!("  charge model     : {}", io.charge.describe());
         match io.charge {
             ChargeModel::SiteSpecific { .. } => {
@@ -286,7 +333,7 @@ fn main() -> Result<()> {
         .par_iter()
         .map(|(id, seq)| {
             if !use_modforms {
-                return io.precursors_of(*id, seq).unwrap_or_default();
+                return suppress_minor_charges(empirical(io.precursors_of(*id, seq).unwrap_or_default(), seq), min_contrib);
             }
             let Some(forms) = modforms.get(id) else {
                 // A peptide with an amount but no modform row means the two artifacts were built
@@ -321,7 +368,7 @@ fn main() -> Result<()> {
                 if let Ok(ps) =
                     io.precursors_of_modform(*id, *mid, seq, comp, *delta, *frac)
                 {
-                    out.extend(suppress_minor_charges(ps, min_contrib));
+                    out.extend(suppress_minor_charges(empirical(ps, seq), min_contrib));
                 }
             }
             out
@@ -362,8 +409,11 @@ fn main() -> Result<()> {
     timsim_schema::write(&out, PRE::TABLE, &batch(PRE::TABLE, cols)?, &producer("timsim-precursors"), None)?;
 
     // ── the accounting ────────────────────────────────────────────────────────
+    // Fraction-weighted over the EMITTED ions and normalised by their own total, so fractions that sum
+    // to < 1 (charge cap, empirical shares) cannot drag the mean below the lowest emitted charge.
+    let frac_total: f64 = all.iter().map(|p| p.charge_fraction as f64).sum();
     let mean_z: f64 = all.iter().map(|p| p.charge as f64 * p.charge_fraction as f64).sum::<f64>()
-        / input.len().max(1) as f64;
+        / frac_total.max(f64::MIN_POSITIVE);
     let fly: Vec<f64> = per_peptide.iter().filter_map(|v| v.first()).map(|p| p.ionization_propensity as f64).collect();
     let mut sorted = fly.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -396,7 +446,22 @@ fn main() -> Result<()> {
              fly.iter().cloned().fold(f64::MAX, f64::min),
              fly.iter().cloned().fold(f64::MIN, f64::max));
     println!("  isotope envelope     : exact from composition, {} peaks", a.isotope_depth);
-    {
+    if let Some(t) = &table {
+        // The site-specific cap loss below would describe the template model, not what was written.
+        let counts: Vec<usize> = level_counts.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        let total = counts.iter().sum::<usize>().max(1);
+        println!("  charge model         : empirical, {} reference peptides from {}", t.len(),
+                 a.charge_table.as_ref().unwrap().display());
+        for (lvl, c) in timsim_cli::charge_table::LEVELS.iter().zip(&counts) {
+            println!("                         {c:>8} modform lookups ({:.1}%) served by {lvl}", *c as f64 / total as f64 * 100.0);
+        }
+        let (lost, n_lost) = *empirical_cap_loss.lock().unwrap();
+        println!(
+            "  charge cap z<={}      : discards {:.4}% of the donors' share mass ({n_lost} lookups affected)",
+            a.max_charge,
+            lost / total as f64 * 100.0
+        );
+    } else {
         let mean_loss = cap_losses.iter().sum::<f64>() / cap_losses.len().max(1) as f64;
         let affected = cap_losses.iter().filter(|&&l| l > 1e-6).count();
         println!(
@@ -410,7 +475,8 @@ fn main() -> Result<()> {
         );
     }
     if skipped > 0 {
-        eprintln!("  warning: {skipped} peptides skipped (non-standard residues)");
+        eprintln!("  warning: {skipped} peptides produced no precursor (non-standard residues, or every charge \
+                   state removed by --max-charge / --min-charge-contrib)");
     }
     println!("  wall time            : {elapsed:.2?}");
     println!();
