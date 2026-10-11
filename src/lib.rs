@@ -25,6 +25,8 @@ pub mod dia;
 #[cfg(feature = "tdf")]
 pub mod dia_ce;
 pub mod dda;
+/// Empirical charge-state model (`timsim-precursors --charge-model empirical`).
+pub mod charge_table;
 /// Pre-flight memory admission for the parallel render (cgroup/MemAvailable aware).
 pub mod memguard;
 /// Mobility-derived per-precursor collision energy (CCS → 1/K0 → scan → CE). Needs the `tdf`
