@@ -618,12 +618,16 @@ fn main() -> Result<()> {
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
     }
-    if !(a.ms2_gain.is_finite() && a.ms2_gain > 0.0) {
-        return Err(anyhow!("--ms2-gain must be finite and > 0, got {}", a.ms2_gain));
+    // Bounded above so the f32 product in `apply_ms2_gain` cannot overflow: fragment spectra are
+    // unit-total, so every peak is <= 1 and 1000 x 1 is far inside f32. v1's MS2/MS1 ratio is a
+    // single-digit factor; a gain anywhere near the bound is a typo, not a calibration.
+    if !(a.ms2_gain.is_finite() && a.ms2_gain > 0.0 && a.ms2_gain <= MS2_GAIN_MAX) {
+        return Err(anyhow!("--ms2-gain must be finite and in (0, {MS2_GAIN_MAX}], got {}", a.ms2_gain));
     }
-    if a.ms2_gain != 1.0 && !a.dia {
-        // Only the DIA projector applies it; accepting it elsewhere would silently do nothing.
-        return Err(anyhow!("--ms2-gain is implemented for --dia only, got {} without --dia", a.ms2_gain));
+    if a.ms2_gain != 1.0 && !(a.dia && !a.dda) {
+        // Only the DIA projector applies it, and --dda wins when both flags are given; accepting it
+        // anywhere else would silently do nothing.
+        return Err(anyhow!("--ms2-gain is implemented for --dia (without --dda) only, got {}", a.ms2_gain));
     }
     // The elution knobs, policed identically in all four renderers (`timsim-render`, `-bench`,
     // `-thermo`, `-sciex`) by the one shared validator. Both sigmas are checked: `sigma_scans` feeds
@@ -1394,6 +1398,9 @@ fn dedup_and_quantise_into(
         ints.push(q);
     }
 }
+
+/// Upper bound of `--ms2-gain` (see the validation in `main`).
+const MS2_GAIN_MAX: f64 = 1000.0;
 
 /// `--ms2-gain` on one projected peak: fragment peaks are multiplied, precursor (MS1) peaks never are.
 /// Gain 1 returns the input untouched rather than round-tripping it through f64, so the default render
