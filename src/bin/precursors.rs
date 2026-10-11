@@ -174,12 +174,21 @@ fn main() -> Result<()> {
     };
     // Per-peptide charge override + which fallback level served it (counted for the report).
     let level_counts: [std::sync::atomic::AtomicUsize; 4] = Default::default();
+    // Share mass the donor carried above --max-charge, summed over lookups (f64 bits in a mutex-free
+    // accumulator would need CAS; a Mutex is simpler and this is not hot).
+    let empirical_cap_loss = std::sync::Mutex::new((0.0f64, 0usize));
     let empirical = |ps: Vec<timsim_chem::Precursor>, seq: &str| -> Vec<timsim_chem::Precursor> {
         match &table {
             None => ps,
             Some(t) => {
                 let (sh, level) = t.shares(seq, a.seed);
                 level_counts[level].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lost: f64 = sh.iter().skip(a.max_charge as usize).map(|&f| f as f64).sum();
+                if lost > 0.0 {
+                    let mut g = empirical_cap_loss.lock().unwrap();
+                    g.0 += lost;
+                    g.1 += 1;
+                }
                 timsim_cli::charge_table::with_shares(ps, &sh, a.max_charge)
             }
         }
@@ -194,6 +203,18 @@ fn main() -> Result<()> {
 
     if a.explain {
         // Printed FROM the model, not from a hand-typed string that can drift away from it.
+        if let Some(t) = &table {
+            println!("  charge model     : empirical — {} reference peptides from {}", t.len(),
+                     a.charge_table.as_ref().unwrap().display());
+            println!("                     each peptide takes the charge-share vector of a reference");
+            println!("                     peptide in its (K+R, H, length) cell, drawn by an identity-");
+            println!("                     keyed hash of (sequence, seed); empty cells fall back to");
+            println!("                     (K+R, H), then K+R, then the whole table");
+            println!("                     shares are the reference's own and may sum to < 1 (states");
+            println!("                     the reference cut are absent); states above z = {} are dropped", a.max_charge);
+            println!("  flyability       : {}", a.flyability);
+            return Ok(());
+        }
         println!("  charge model     : {}", io.charge.describe());
         match io.charge {
             ChargeModel::SiteSpecific { .. } => {
@@ -388,8 +409,11 @@ fn main() -> Result<()> {
     timsim_schema::write(&out, PRE::TABLE, &batch(PRE::TABLE, cols)?, &producer("timsim-precursors"), None)?;
 
     // ── the accounting ────────────────────────────────────────────────────────
+    // Fraction-weighted over the EMITTED ions and normalised by their own total, so fractions that sum
+    // to < 1 (charge cap, empirical shares) cannot drag the mean below the lowest emitted charge.
+    let frac_total: f64 = all.iter().map(|p| p.charge_fraction as f64).sum();
     let mean_z: f64 = all.iter().map(|p| p.charge as f64 * p.charge_fraction as f64).sum::<f64>()
-        / input.len().max(1) as f64;
+        / frac_total.max(f64::MIN_POSITIVE);
     let fly: Vec<f64> = per_peptide.iter().filter_map(|v| v.first()).map(|p| p.ionization_propensity as f64).collect();
     let mut sorted = fly.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -431,6 +455,12 @@ fn main() -> Result<()> {
         for (lvl, c) in timsim_cli::charge_table::LEVELS.iter().zip(&counts) {
             println!("                         {c:>8} modform lookups ({:.1}%) served by {lvl}", *c as f64 / total as f64 * 100.0);
         }
+        let (lost, n_lost) = *empirical_cap_loss.lock().unwrap();
+        println!(
+            "  charge cap z<={}      : discards {:.4}% of the donors' share mass ({n_lost} lookups affected)",
+            a.max_charge,
+            lost / total as f64 * 100.0
+        );
     } else {
         let mean_loss = cap_losses.iter().sum::<f64>() / cap_losses.len().max(1) as f64;
         let affected = cap_losses.iter().filter(|&&l| l > 1e-6).count();
@@ -445,7 +475,8 @@ fn main() -> Result<()> {
         );
     }
     if skipped > 0 {
-        eprintln!("  warning: {skipped} peptides skipped (non-standard residues)");
+        eprintln!("  warning: {skipped} peptides produced no precursor (non-standard residues, or every charge \
+                   state removed by --max-charge / --min-charge-contrib)");
     }
     println!("  wall time            : {elapsed:.2?}");
     println!();

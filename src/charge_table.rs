@@ -95,6 +95,9 @@ impl ChargeTable {
             if len == 0 {
                 bail!("row {row}: length must be >= 1");
             }
+            if n_kr + n_h > len {
+                bail!("row {row}: {n_kr} K/R + {n_h} H cannot fit in a peptide of length {len}");
+            }
             let mut f: Shares = [0.0; TABLE_MAX_CHARGE];
             for (k, s) in v[3..].iter().enumerate() {
                 let x: f32 = s.parse().map_err(|e| anyhow!("row {row}: bad fraction {s:?}: {e}"))?;
@@ -233,7 +236,16 @@ mod tests {
     }
 
     #[test]
+    fn different_sequences_in_one_cell_draw_different_donors() {
+        let t = ChargeTable::parse(T).unwrap();
+        let seqs = ["PEPTIDEK", "PEPTIDAR", "AEPTIDEK", "PEPSIDEK", "PEPTLDEK", "GEPTIDEK", "PEPTIDNK", "QEPTIDEK"];
+        let picks: std::collections::HashSet<u32> = seqs.iter().map(|s| t.shares(s, 3).0[1].to_bits()).collect();
+        assert_eq!(picks.len(), 2, "one seed, several sequences of one cell must reach both donors");
+    }
+
+    #[test]
     fn malformed_tables_are_refused() {
+        assert!(ChargeTable::parse("n_kr\tn_h\tlength\tf1\tf2\tf3\tf4\n100\t100\t1\t0\t1\t0\t0\n").is_err());
         assert!(ChargeTable::parse("n_kr\tn_h\tlength\tf1\tf2\tf3\n1\t0\t8\t0\t1\t0\n").is_err());
         assert!(ChargeTable::parse("n_kr\tn_h\tlength\tf1\tf2\tf3\tf4\n1\t0\t8\t0\t0.8\t0.4\t0\n").is_err());
         assert!(ChargeTable::parse("n_kr\tn_h\tlength\tf1\tf2\tf3\tf4\n1\t0\t8\t0\t0\t0\t0\n").is_err());
@@ -260,7 +272,13 @@ mod tests {
         let ours_2 = out.iter().find(|p| p.charge == 2).unwrap();
         assert_eq!(own_2.mz.to_bits(), ours_2.mz.to_bits());
         assert_eq!(own_2.precursor_id, ours_2.precursor_id);
-        assert_eq!(with_shares(ps, &[0.0, 0.5, 0.3, 0.15], 3).len(), 2, "max_charge caps the table");
+        assert_eq!(with_shares(ps.clone(), &[0.0, 0.5, 0.3, 0.15], 3).len(), 2, "max_charge caps the table");
+        // The modform's own envelope is carried over unchanged to every rebuilt charge.
+        assert!(out.iter().all(|p| p.isotope_intensity == ps[0].isotope_intensity));
+        // A template that is not 1+ (a modified, higher-charge-only form) recovers the same mass.
+        let only3: Vec<_> = ps.iter().filter(|p| p.charge == 2).cloned().collect();
+        let re = with_shares(only3, &[0.0, 0.0, 1.0, 0.0], 4);
+        assert!((re[0].mz - timsim_chem::isotope::mz(mono, 3, 0)).abs() < 1e-9);
         assert!(with_shares(Vec::new(), &[0.0, 1.0, 0.0, 0.0], 4).is_empty());
     }
 }
