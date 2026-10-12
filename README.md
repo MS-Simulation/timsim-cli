@@ -55,7 +55,12 @@ Feature space → sweep-line render → a real timsTOF `.d` via `ms-io`'s `TdfWr
   verbatim and *place* ions with that same calibration, so a vendor reader (openTIMS/DiaNN) derives
   the correct m/z and 1/K0. Without it, a self-consistent reference-free converter is used.
 - **Noise A1** (`--noise-mz-ppm`, `--noise-frag-ppm`): Gaussian (or `--noise-mz-uniform`) m/z scatter
-  as a **ppm envelope**, matching v1's convention where ppm = 3σ.
+  as a **ppm envelope**, matching v1's convention where ppm = 3σ. `--noise-mz-draw` sets the scope of
+  one draw:
+  - `per-peak` (default): one offset per peak for the whole run. A search engine cannot average it
+    away, so DIA-NN measures about 3 ppm, as on real timsTOF runs.
+  - `per-observation`: v1's scope, a fresh offset per (frame, scan). It averages out to about 0.6 ppm,
+    so use it to reproduce a v1 dataset.
 - **Noise A2** (`--noise-real-data`): real background peaks sampled from the reference `.d` and added
   on top of the synthetic signal.
 - **`--noise-only`**: the background-only control run — search it, and subtract its IDs from your FDP
