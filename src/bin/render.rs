@@ -238,6 +238,15 @@ struct Args {
     /// ppm. (v1's asymmetric `right_drag` tailing variant is not ported.)
     #[arg(long, default_value_t = false)]
     noise_mz_uniform: bool,
+    /// Noise A1 — the SCOPE of one m/z draw. `per-peak` (default): one offset per (precursor, peak),
+    /// coherent across the peak's whole elution. `per-observation`: v1's scope, a fresh offset for every
+    /// (frame, scan) the peak is deposited in, which averages out across the elution. They differ in what
+    /// a search engine sees after integrating a peak: on the DIA-H01 pilot, DIA-NN measured a true-hit
+    /// m/z error sd of 2.9 ppm on `per-peak` renders, 0.6 ppm on v1's runs and about 3 ppm on real timsTOF
+    /// HeLa runs, and chose a 10 ppm vs 2.8 ppm tolerance accordingly. `per-observation` is for
+    /// reproducing a v1 dataset. `--dia` (without `--dda`) only; no-op when both ppm are 0.
+    #[arg(long, value_enum, default_value_t = MzDrawArg::PerPeak)]
+    noise_mz_draw: MzDrawArg,
     /// Noise A3 — **ion-counting statistics** on every synthetic detector bin.
     ///
     /// Named `--ion-count-noise` rather than `--shot-noise` deliberately: in MS usage "shot noise"
@@ -420,7 +429,9 @@ struct Placement {
     /// `rt_cycle_length = np.mean(np.diff(reference_ds.meta_data.Time))`. v2 inherited the frame
     /// COUNT and the windows but not the clock, which is how the two came apart.
     ref_cycle_seconds: Option<Result<f64, String>>,
-    to_tof: Box<dyn Fn(f64) -> u32>,
+    /// `Sync` (both converters capture only plain `f64` data) so the per-observation m/z draw can
+    /// convert inside the parallel sweep. The other closures stay thread-local.
+    to_tof: Box<dyn Fn(f64) -> u32 + Send + Sync>,
     to_scan: Box<dyn Fn(f64) -> u32>,
     /// scan -> `1/K0`, the inverse of [`Self::to_scan`]. Needed because the map is NONLINEAR, so a
     /// per-ion width in `1/K0` becomes a different number of SCANS depending where on the ramp the
@@ -562,6 +573,16 @@ fn build_placement(a: &Args) -> Result<Placement> {
 }
 
 
+/// `--noise-mz-draw`: the scope of one A1 m/z draw. See [`timsim_cli::ms2::ObsNoise`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum MzDrawArg {
+    /// One offset per (precursor, peak), coherent across its elution (the default; byte-identical to
+    /// the render before the flag existed).
+    PerPeak,
+    /// v1's scope: an independent offset per (precursor, peak, frame, scan) observation.
+    PerObservation,
+}
+
 /// CLI spelling of [`timsim_cli::render::PeakShape`] (the real one carries derived constants).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum PeakShapeArg {
@@ -628,6 +649,13 @@ fn main() -> Result<()> {
         // Only the DIA projector applies it, and --dda wins when both flags are given; accepting it
         // anywhere else would silently do nothing.
         return Err(anyhow!("--ms2-gain is implemented for --dia (without --dda) only, got {}", a.ms2_gain));
+    }
+    if a.noise_mz_draw == MzDrawArg::PerObservation
+        && (a.noise_mz_ppm > 0.0 || a.noise_frag_ppm > 0.0)
+        && !(a.dia && !a.dda)
+    {
+        // Only the DIA sweep draws per observation; elsewhere the flag would silently do nothing.
+        return Err(anyhow!("--noise-mz-draw per-observation is implemented for --dia (without --dda) only"));
     }
     // The elution knobs, policed identically in all four renderers (`timsim-render`, `-bench`,
     // `-thermo`, `-sciex`) by the one shared validator. Both sigmas are checked: `sigma_scans` feeds
@@ -1741,10 +1769,16 @@ fn hash01(x: u64) -> f64 {
 /// cancelled by another: the MS1 vs MS2 peak streams (`is_frag`) and distinct `seed`s stay genuinely
 /// independent, not merely offset. Keying on `(pc, is_frag, k, seed)` — rather than on the frame/scan —
 /// makes the draw reproducible and stable under `--limit`: adding or removing ions leaves every other
-/// draw unchanged. This is a deliberate divergence from v1, which redraws m/z noise independently per
-/// scan; here a peak's scatter is a single offset coherent across its whole elution. The marginal
-/// mass-error distribution a search engine calibrates against is the same; only the within-elution
-/// correlation differs (v1: independent per scan; v2: constant per peak).
+/// draw unchanged. Under the default `--noise-mz-draw per-peak` a peak's scatter is a single offset
+/// coherent across its whole elution, a deliberate divergence from v1, which redraws m/z noise
+/// independently per scan.
+///
+/// The divergence is NOT invisible to a search engine, as was assumed here: an engine integrates a peak
+/// over its scans and frames, which averages v1's draws away but not a per-peak offset. Measured on the
+/// DIA-H01 pilot, DIA-NN's true-hit m/z error sd is 0.6 ppm on v1's runs and 2.9 ppm on `per-peak`
+/// renders, and DIA-NN tunes its tolerance to match (2.8 vs 10 ppm). Real timsTOF HeLa runs sit near
+/// `per-peak` (about 3 ppm, 10 ppm). `--noise-mz-draw per-observation` reproduces v1's scope, and keys
+/// each observation on this state plus its `(frame, scan)` (`timsim_cli::ms2::ObsNoise`).
 fn noise_state(pc: u64, is_frag: bool, k: usize, seed: u64) -> u64 {
     let z = splitmix64(seed ^ if is_frag { 0x9E37_79B9_7F4A_7C15 } else { 0 });
     splitmix64(splitmix64(z ^ pc) ^ k as u64)
@@ -2268,9 +2302,21 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
 }
 
 /// DIA render: MS1+MS2 frames on the reference's cycle, fragments gated by the diagonal transmission.
+/// One precursor's projected spectra while `run_dia` streams `ion_spectra`: whether it has an MS1
+/// spectrum, both projected peak lists, and (`--noise-mz-draw per-observation` only) the unprojected
+/// candidates each observation draws its own m/z offset for.
+#[derive(Default)]
+struct IonPeaks {
+    had_ms1: bool,
+    ms1: Vec<(u32, f32)>,
+    ms2: Vec<(u32, f32)>,
+    ms1_obs: Vec<timsim_cli::ms2::ObsPeak>,
+    ms2_obs: Vec<timsim_cli::ms2::ObsPeak>,
+}
+
 fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance, mob: &MobilityWidth, jit: &RunJitter) -> Result<()> {
     use timsim_cli::dia::DiaSchedule;
-    use timsim_cli::ms2::{active_frames, dia_render_range, DiaIon};
+    use timsim_cli::ms2::{active_frames, dia_render_range, project_per_observation, DiaIon, ObsNoise, ObsPeak};
 
     let ref_d = a.reference_d.as_ref().ok_or_else(|| anyhow!("--dia requires --reference-d (a DIA .d for the window schedule)"))?;
     let sched = DiaSchedule::from_reference(ref_d.to_str().unwrap(), a.n_frames, p.n_scans)?;
@@ -2302,14 +2348,27 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
     // ion_spectra is NOT loaded up front — it is streamed once per apex-chunk below, so peak memory is
     // one chunk's active ions rather than every precursor's spectra at once.
 
-    // Project each precursor's spectra to tof and build DIA ions.
-    let project = |pc: u64, is_frag: bool, peaks: &[(f64, f32)]| -> Vec<(u32, f32)> {
+    // Project each precursor's spectra to tof and build DIA ions. Returns the projected `(tof, intensity)`
+    // peaks and, for `--noise-mz-draw per-observation`, the unprojected candidates each observation
+    // draws its own offset for at deposit time (empty otherwise).
+    let per_obs = a.noise_mz_draw == MzDrawArg::PerObservation;
+    let project = |pc: u64, is_frag: bool, peaks: &[(f64, f32)]| -> (Vec<(u32, f32)>, Vec<ObsPeak>) {
+        let ppm = if is_frag { a.noise_frag_ppm } else { a.noise_mz_ppm };
+        if per_obs {
+            // v1's scope: no draw here. The noiseless projection serves a level whose ppm is 0; the
+            // candidates carry each peak's draw identity, indexed before any filtering like the per-peak
+            // draw below.
+            return project_per_observation(
+                peaks, ppm, p.mz_min, p.mz_max, p.tof_max, &*p.to_tof,
+                |k| noise_state(pc, is_frag, k, a.noise_seed),
+                |inten| apply_ms2_gain(inten, is_frag, a.ms2_gain),
+            );
+        }
         // A1 signal-m/z noise: per-peak m/z scatter applied before m/z→tof, matching v1's `add_mz_noise_*`.
         // `ppm` is a 3σ envelope (v1 convention). `ppm == 0` keeps `m` untouched → byte-identical noiseless
         // render. Gaussian (default): sd = mz·ppm/1e6/3 (v1 `add_mz_noise_normal`). Uniform: mz ± mz·ppm/1e6
         // (v1 `add_mz_noise_uniform`, right_drag=false).
-        let ppm = if is_frag { a.noise_frag_ppm } else { a.noise_mz_ppm };
-        peaks
+        let projected = peaks
             .iter()
             .enumerate()
             .filter_map(|(k, &(m, inten))| {
@@ -2330,8 +2389,24 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                     Some(((p.to_tof)(m).min(p.tof_max.saturating_sub(1)), inten))
                 }
             })
-            .collect()
+            .collect();
+        (projected, Vec::new())
     };
+    // The deposit-time draw for `per-observation` (`None` = the per-peak render, unchanged). Borrows only
+    // the `Sync` m/z→TOF converter, so it can cross into the parallel sweeps.
+    let obs_noise: Option<ObsNoise> = per_obs.then_some(ObsNoise {
+        ppm_ms1: a.noise_mz_ppm,
+        ppm_ms2: a.noise_frag_ppm,
+        uniform: a.noise_mz_uniform,
+        mz_min: p.mz_min,
+        mz_max: p.mz_max,
+        tof_max: p.tof_max,
+        to_tof: &*p.to_tof,
+    });
+    let obs = obs_noise.as_ref();
+    if per_obs && (a.noise_mz_ppm > 0.0 || a.noise_frag_ppm > 0.0) {
+        eprintln!("  A1 m/z noise drawn per observation (v1 scope): MS1 {} ppm, MS2 {} ppm", a.noise_mz_ppm, a.noise_frag_ppm);
+    }
     let ccs = load_ccs(&a.precursor_ccs)?;
     let amounts = load_amounts(&a.peptide_quantities, &a.sample)?;
     if amounts.is_empty() {
@@ -2508,8 +2583,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         use rayon::prelude::*;
         // 1) Build ALL DiaIons resident (one streaming pass). Project m/z->tof HERE, sequentially — the
         //    projection closure captures the non-Sync `Placement`, so it must not cross the rayon boundary.
-        let mut builders: HashMap<u64, (bool, Vec<(u32, f32)>, Vec<(u32, f32)>)> =
-            HashMap::with_capacity(meta.len());
+        let mut builders: HashMap<u64, IonPeaks> = HashMap::with_capacity(meta.len());
         for b in timsim_schema::read_stream(&a.ion_spectra, SP::TABLE)? {
             let b = b?;
             let pcid: &UInt64Array = b.column_by_name(SP::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
@@ -2522,22 +2596,23 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 let mzv = mz.value(i); let mzv: &Float64Array = mzv.as_any().downcast_ref().unwrap();
                 let iv = inten.value(i); let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
                 let raw: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
-                let proj = project(pc, level.value(i) == 2, &raw);
-                let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
+                let (proj, cand) = project(pc, level.value(i) == 2, &raw);
+                let e = builders.entry(pc).or_default();
                 match level.value(i) {
-                    1 => { e.0 = true; e.1 = proj; }
-                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.2 = proj; }
+                    1 => { e.had_ms1 = true; e.ms1 = proj; e.ms1_obs = cand; }
+                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.ms2 = proj; e.ms2_obs = cand; }
                     _ => {}
                 }
             }
         }
         // Same keep rule + global-order sort as the serial path (so per-frame deposit order is identical).
-        let mut ions: Vec<(u32, DiaIon)> = builders.into_iter().filter_map(|(pc, (had, m1, m2))| {
-            if !had || (m1.is_empty() && m2.is_empty()) { return None; }
+        let mut ions: Vec<(u32, DiaIon)> = builders.into_iter().filter_map(|(pc, e)| {
+            if !e.had_ms1 || (e.ms1.is_empty() && e.ms2.is_empty()) { return None; }
             let m = meta.get(&pc)?;
             Some((m.order, DiaIon {
                 apex_frame: m.apex_frame, scan_center: m.scan, abundance: m.abundance,
-                precursor_mz: m.precursor_mz, ms1_peaks: m1, ms2_peaks: m2, survival: m.survival,
+                precursor_mz: m.precursor_mz, ms1_peaks: e.ms1, ms2_peaks: e.ms2,
+                ms1_obs: e.ms1_obs, ms2_obs: e.ms2_obs, survival: m.survival,
                 elution: m.elution, sigma_scans: m.sigma_scans,
             }))
         }).collect();
@@ -2586,7 +2661,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let mut err: Option<String> = None;
             // One scratch set per frame-chunk, reused across its frames (see `DedupBufs`).
             let mut bufs = DedupBufs::default();
-            dia_render_range(&subset, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
+            dia_render_range(&subset, &sched, g, fc0, fc1, emit_all, obs, |frame, ms_type, tri| {
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
@@ -2625,8 +2700,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         }
 
         // Build this chunk's active ions by streaming ion_spectra once and keeping only the precursors
-        // whose elution window overlaps [fc0, fc1]. (had_ms1, ms1_peaks, ms2_peaks) per precursor.
-        let mut builders: HashMap<u64, (bool, Vec<(u32, f32)>, Vec<(u32, f32)>)> = HashMap::new();
+        // whose elution window overlaps [fc0, fc1].
+        let mut builders: HashMap<u64, IonPeaks> = HashMap::new();
         for b in timsim_schema::read_stream(&a.ion_spectra, SP::TABLE)? {
             let b = b?;
             let pcid: &UInt64Array = b.column_by_name(SP::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
@@ -2645,11 +2720,11 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 let iv = inten.value(i);
                 let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
                 let raw: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
-                let proj = project(pc, level.value(i) == 2, &raw);
-                let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
+                let (proj, cand) = project(pc, level.value(i) == 2, &raw);
+                let e = builders.entry(pc).or_default();
                 match level.value(i) {
-                    1 => { e.0 = true; e.1 = proj; }
-                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.2 = proj; }
+                    1 => { e.had_ms1 = true; e.ms1 = proj; e.ms1_obs = cand; }
+                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.ms2 = proj; e.ms2_obs = cand; }
                     _ => {}
                 }
             }
@@ -2660,8 +2735,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         // deposits in the same sequence as the unchunked render (byte-identical output).
         let mut ions: Vec<(u32, DiaIon)> = builders
             .into_iter()
-            .filter_map(|(pc, (had_ms1, ms1p, ms2p))| {
-                if !had_ms1 || (ms1p.is_empty() && ms2p.is_empty()) {
+            .filter_map(|(pc, e)| {
+                if !e.had_ms1 || (e.ms1.is_empty() && e.ms2.is_empty()) {
                     return None;
                 }
                 let m = meta.get(&pc)?;
@@ -2672,8 +2747,10 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         scan_center: m.scan,
                         abundance: m.abundance,
                         precursor_mz: m.precursor_mz,
-                        ms1_peaks: ms1p,
-                        ms2_peaks: ms2p,
+                        ms1_peaks: e.ms1,
+                        ms2_peaks: e.ms2,
+                        ms1_obs: e.ms1_obs,
+                        ms2_obs: e.ms2_obs,
                         survival: m.survival,
                         elution: m.elution,
                         sigma_scans: m.sigma_scans,
@@ -2689,7 +2766,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             // `--no-parallel`: fully serial, the byte-identity escape hatch. One `dia_render_range` sweep
             // over the chunk, encoding and appending each frame inline via `write_frame`.
             let mut err: Result<()> = Ok(());
-            dia_render_range(&ions, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
+            dia_render_range(&ions, &sched, g, fc0, fc1, emit_all, obs, |frame, ms_type, tri| {
                 if err.is_err() {
                     return;
                 }
@@ -2719,7 +2796,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             // machinery the resident fast path uses, applied to one chunk's frame range. Peak memory is
             // still one chunk's active ions (the sub-ranges SHARE `&ions` — nothing is cloned).
             render_range_parallel(
-                &mut writer, &ions, &sched, g, fc0, fc1, emit_all, &frame_noise,
+                &mut writer, &ions, &sched, g, fc0, fc1, emit_all, &frame_noise, obs,
                 &ParallelRenderCfg {
                     ion_count_seed: a.ion_count_noise.then_some(a.noise_seed),
                     instrument_cv: (a.instrument_cv > 0.0).then_some((a.instrument_cv, a.noise_seed)),
@@ -2857,6 +2934,7 @@ fn render_range_parallel(
     frame_hi: u32,
     emit_all: bool,
     frame_noise: &HashMap<u32, Vec<(u32, u32, f64)>>,
+    obs: Option<&timsim_cli::ms2::ObsNoise>,
     cfg: &ParallelRenderCfg,
     next_fid: &mut u32,
     ms1_peaks: &mut u64,
@@ -2922,7 +3000,7 @@ fn render_range_parallel(
                 // allocation churn a per-SUB-RANGE cost — the render's hot loop stops handing the
                 // allocator millions of short-lived multi-megabyte blocks on every thread.
                 let mut bufs = DedupBufs::default();
-                dia_render_range(ions, sched, g, f0, f1, emit_all, |frame, ms_type, tri| {
+                dia_render_range(ions, sched, g, f0, f1, emit_all, obs, |frame, ms_type, tri| {
                     if err.is_some() {
                         return;
                     }
