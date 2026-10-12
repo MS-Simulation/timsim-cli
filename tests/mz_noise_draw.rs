@@ -128,6 +128,23 @@ fn per_observation_is_the_same_on_every_render_path_and_conserves_level_totals()
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// `--noise-mz-uniform` keeps its bare spelling and also takes an explicit value (how necroflow passes it).
+#[test]
+fn uniform_flag_takes_a_bare_or_an_explicit_value() {
+    let base = scratch("uniform");
+    if !fixtures_present(&base) {
+        return;
+    }
+    let (_, _, bare) = render(&base, "bare", &with(&PPM, &["--noise-mz-uniform"]));
+    let (_, _, yes) = render(&base, "true", &with(&PPM, &["--noise-mz-uniform", "true"]));
+    assert!(bare == yes, "bare --noise-mz-uniform differs from --noise-mz-uniform true");
+    let (_, _, no) = render(&base, "false", &with(&PPM, &["--noise-mz-uniform", "false"]));
+    let (_, _, omitted) = render(&base, "omitted", &PPM);
+    assert!(no == omitted, "--noise-mz-uniform false differs from omitting it");
+    assert!(yes != no, "uniform and Gaussian rendered the same bytes");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn per_observation_is_refused_where_it_would_be_ignored() {
     if !bin().exists() {

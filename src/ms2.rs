@@ -119,6 +119,13 @@ impl ObsNoise<'_> {
     }
 }
 
+/// Whether a precursor becomes a [`DiaIon`]: it needs an MS1 spectrum and something to deposit, i.e. a
+/// projected peak or (`per-observation`) a candidate that can scatter into the acquisition range. With no
+/// candidates (`per-peak`, or ppm 0) this is the original rule, unchanged.
+pub fn keeps_ion(had_ms1: bool, ms1: &[(u32, f32)], ms2: &[(u32, f32)], ms1_obs: &[ObsPeak], ms2_obs: &[ObsPeak]) -> bool {
+    had_ms1 && !(ms1.is_empty() && ms2.is_empty() && ms1_obs.is_empty() && ms2_obs.is_empty())
+}
+
 /// The `per-observation` projection of one spectrum. Returns:
 /// - `fixed`: the NOISELESS `(tof, intensity)` peaks inside `[mz_min, mz_max]` — exactly what the
 ///   `per-peak` projection gives at ppm 0, and what a level whose ppm is 0 deposits;
@@ -843,6 +850,21 @@ mod tests {
         let inside = 1700.0 * (1.0 - 5e-6);
         let (all, kept) = (ms1_count(inside, None), ms1_count(inside, Some(&cfg)));
         assert!(kept > 0 && kept < all, "inside peak: {kept} of {all} observations kept");
+    }
+
+    /// An ion whose noiseless peaks all fall just outside the acquisition range is still rendered when it
+    /// has candidates that can scatter in; without candidates the rule is the original one.
+    #[test]
+    fn ions_with_only_edge_candidates_are_kept() {
+        let c = [ObsPeak { mz: 1700.01, inten: 1.0, h: 1 }];
+        let p = [(1u32, 1.0f32)];
+        assert!(keeps_ion(true, &[], &[], &c, &[]), "MS1 candidate only");
+        assert!(keeps_ion(true, &[], &[], &[], &c), "MS2 candidate only");
+        assert!(!keeps_ion(false, &p, &p, &c, &c), "no MS1 spectrum");
+        for (m1, m2) in [(&p[..], &[][..]), (&[][..], &p[..]), (&p[..], &p[..]), (&[][..], &[][..])] {
+            let original = !(m1.is_empty() && m2.is_empty());
+            assert_eq!(keeps_ion(true, m1, m2, &[], &[]), original, "per-peak rule changed");
+        }
     }
 
     /// Candidates keep their RAW peak index as the draw identity, even when earlier peaks are filtered out.

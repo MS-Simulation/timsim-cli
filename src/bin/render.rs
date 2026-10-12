@@ -235,8 +235,10 @@ struct Args {
     noise_frag_ppm: f64,
     /// Noise A1 — use **uniform** m/z scatter (v1 `mz_noise_uniform=true`): a symmetric `mz ± mz·ppm/1e6`
     /// draw instead of the default Gaussian `add_mz_noise_normal`. Applies to both precursor and fragment
-    /// ppm. (v1's asymmetric `right_drag` tailing variant is not ported.)
-    #[arg(long, default_value_t = false)]
+    /// ppm. (v1's asymmetric `right_drag` tailing variant is not ported.) Bare `--noise-mz-uniform` means
+    /// `true`; it also takes an explicit `true`/`false`, so the DAG runner can always pass it as a valued
+    /// flag (see `--ion-count-noise` for why a conditionally-present flag breaks there).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     noise_mz_uniform: bool,
     /// Noise A1 — the SCOPE of one m/z draw. `per-peak` (default): one offset per (precursor, peak),
     /// coherent across the peak's whole elution. `per-observation`: v1's scope, a fresh offset for every
@@ -2316,7 +2318,7 @@ struct IonPeaks {
 
 fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance, mob: &MobilityWidth, jit: &RunJitter) -> Result<()> {
     use timsim_cli::dia::DiaSchedule;
-    use timsim_cli::ms2::{active_frames, dia_render_range, project_per_observation, DiaIon, ObsNoise, ObsPeak};
+    use timsim_cli::ms2::{active_frames, dia_render_range, keeps_ion, project_per_observation, DiaIon, ObsNoise, ObsPeak};
 
     let ref_d = a.reference_d.as_ref().ok_or_else(|| anyhow!("--dia requires --reference-d (a DIA .d for the window schedule)"))?;
     let sched = DiaSchedule::from_reference(ref_d.to_str().unwrap(), a.n_frames, p.n_scans)?;
@@ -2607,7 +2609,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         }
         // Same keep rule + global-order sort as the serial path (so per-frame deposit order is identical).
         let mut ions: Vec<(u32, DiaIon)> = builders.into_iter().filter_map(|(pc, e)| {
-            if !e.had_ms1 || (e.ms1.is_empty() && e.ms2.is_empty()) { return None; }
+            if !keeps_ion(e.had_ms1, &e.ms1, &e.ms2, &e.ms1_obs, &e.ms2_obs) { return None; }
             let m = meta.get(&pc)?;
             Some((m.order, DiaIon {
                 apex_frame: m.apex_frame, scan_center: m.scan, abundance: m.abundance,
@@ -2730,13 +2732,13 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             }
         }
 
-        // Assemble DiaIons — same keep rule as the single-pass render (an MS1 spectrum must exist and at
-        // least one projected spectrum is non-empty) — sorted back into precursor-file order so the sweep
+        // Assemble DiaIons — same keep rule as the single-pass render (`keeps_ion`: an MS1 spectrum must
+        // exist and there must be something to deposit) — sorted back into precursor-file order so the sweep
         // deposits in the same sequence as the unchunked render (byte-identical output).
         let mut ions: Vec<(u32, DiaIon)> = builders
             .into_iter()
             .filter_map(|(pc, e)| {
-                if !e.had_ms1 || (e.ms1.is_empty() && e.ms2.is_empty()) {
+                if !keeps_ion(e.had_ms1, &e.ms1, &e.ms2, &e.ms1_obs, &e.ms2_obs) {
                     return None;
                 }
                 let m = meta.get(&pc)?;
