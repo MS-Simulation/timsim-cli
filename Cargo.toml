@@ -34,10 +34,11 @@ path = "src/bin/yield.rs"
 # the TDF stack, so it pulls nothing new.
 sha2 = "0.10"
 # The chemistry core and the schema contract. 0.2.0 adds per-protein `regulate` magnitudes,
-# regulated-implies-present forcing, and the `requested_log2fc` column. Working on them and this
+# regulated-implies-present forcing, and the `requested_log2fc` column; timsim-chem 0.3.0 adds the
+# Coulomb term to the site-specific charge model (the default). Working on them and this
 # repo at the same time? Put a [patch.crates-io] in a git-ignored `.cargo/config.toml` here — never
 # in this manifest, or a clone without the sibling checkout stops building.
-timsim-chem = "0.2.1"
+timsim-chem = "0.3.0"
 timsim-schema = "0.2.1"
 arrow = "56"
 parquet = "56"

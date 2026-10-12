@@ -58,8 +58,9 @@ struct Args {
     #[arg(long)]
     out: Option<PathBuf>,
 
-    /// `site-specific` (default — gas-phase basicity R > K > H; a clean tryptic peptide comes out
-    /// 88.7% doubly charged) or `binomial` (v1 parity — every basic site equal, which calls a third
+    /// `site-specific` (default — gas-phase basicity R > K > H, and a length-scaled Coulomb penalty
+    /// on z >= 3 fitted on real diaPASEF; a clean tryptic peptide comes out 88.7% doubly charged, which
+    /// the Coulomb term does not touch) or `binomial` (v1 parity — every basic site equal, which calls a third
     /// of all clean tryptic peptides singly-charged, and is kept only for comparison), or
     /// `empirical` (resample each peptide's charge-share vector from `--charge-table`; see
     /// `timsim_cli::charge_table` — how a published v1 dataset's charge mix is reproduced).
@@ -220,6 +221,7 @@ fn main() -> Result<()> {
             ChargeModel::SiteSpecific { .. } => {
                 println!("                     gas-phase basicity R > K > H — a binomial cannot order them");
                 println!("                     Poisson-binomial over the sites");
+                println!("                     Coulomb repulsion: z >= 3 penalised, more on short peptides");
                 println!("                     a clean tryptic peptide comes out 88.7% doubly charged");
             }
             ChargeModel::Binomial { .. } => {

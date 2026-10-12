@@ -2987,9 +2987,9 @@ dependencies = [
 
 [[package]]
 name = "timsim-chem"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1380d5b35f366d204de0bb069ec2b0325bc5fed98d6623e2a64921e6b9e733c0"
+checksum = "25d52d5792cdc1e42ea71cc71ce438388e0729516b8b37425b5c5c0d984a9fad"
 dependencies = [
  "rayon",
  "regex",
