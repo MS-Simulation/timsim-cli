@@ -39,6 +39,8 @@ pub mod ms2;
 /// Which elution kernel produced an artifact, recorded INTO the artifact — the answer to "is this
 /// cached render stale?" that does not depend on a fingerprint travelling alongside the file.
 pub mod provenance;
+/// The per-sample abundance axis (`peptide_quantities`), loaded the same way by every render.
+pub mod quantities;
 pub mod render;
 pub mod sequences;
 pub mod spec;

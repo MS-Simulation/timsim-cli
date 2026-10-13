@@ -15,13 +15,14 @@
 //! fixed — the same sample "acquired" on another device.
 
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, Float32Array, Float64Array, ListArray, StringArray, UInt64Array, UInt8Array};
+use arrow::array::{Array, Float32Array, Float64Array, ListArray, UInt64Array, UInt8Array};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use mscore::timstof::quadrupole::WindowTransmission;
 use timsim_core::acquisition::{AcquisitionWriter, ScanDescriptor, ThermoRawWriter};
+use timsim_cli::quantities::load_amounts;
 use timsim_schema::tables::ion_spectra as SP;
 use timsim_schema::tables::{peptide_rt as RT, precursors as PRE};
 
@@ -208,33 +209,6 @@ fn load_list_spectra(path: &PathBuf, want_level: u8) -> Result<HashMap<u64, Vec<
             let iv = inten.value(i); let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
             let peaks: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
             out.insert(pcid.value(i), peaks);
-        }
-    }
-    Ok(out)
-}
-
-fn load_amounts(path: &Option<PathBuf>, sample: &Option<String>) -> Result<HashMap<u64, f64>> {
-    use timsim_schema::tables::peptide_quantities as PQ;
-    let mut out = HashMap::new();
-    let Some(path) = path else { return Ok(out) };
-    let chosen = match sample {
-        Some(s) => s.clone(),
-        None => {
-            let mut samples: Vec<String> = Vec::new();
-            for b in timsim_schema::read(path, PQ::TABLE)? {
-                let s: &StringArray = b.column_by_name(PQ::SAMPLE_ID).unwrap().as_any().downcast_ref().unwrap();
-                for i in 0..b.num_rows() { samples.push(s.value(i).to_string()); }
-            }
-            samples.sort(); samples.dedup();
-            samples.into_iter().next().ok_or_else(|| anyhow!("{} has no samples", path.display()))?
-        }
-    };
-    for b in timsim_schema::read(path, PQ::TABLE)? {
-        let pid: &UInt64Array = b.column_by_name(PQ::PEPTIDE_ID).unwrap().as_any().downcast_ref().unwrap();
-        let sid: &StringArray = b.column_by_name(PQ::SAMPLE_ID).unwrap().as_any().downcast_ref().unwrap();
-        let amt: &Float64Array = b.column_by_name(PQ::AMOUNT_AMOL).unwrap().as_any().downcast_ref().unwrap();
-        for i in 0..b.num_rows() {
-            if sid.value(i) == chosen { out.insert(pid.value(i), amt.value(i)); }
         }
     }
     Ok(out)
