@@ -201,14 +201,16 @@ fn main() -> Result<()> {
     // Validate-on-read: a wrong or renamed column fails HERE, not three stages downstream.
     let batches = timsim_schema::read(&proteome, PROT::TABLE)?;
     let mut input: Vec<(String, String)> = Vec::new();
-    let mut organism: Vec<Option<String>> = Vec::new(); // parallel to `input`; only the quotas read it
+    let mut organism: Vec<Option<String>> = Vec::new(); // parallel to `input`, filled only for the quotas
     for b in &batches {
         let id = b.column_by_name(PROT::PROTEIN_ID).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
         let sq = b.column_by_name(PROT::SEQUENCE).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
         let org = b.column_by_name(PROT::ORGANISM).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
         for i in 0..b.num_rows() {
             input.push((id.value(i).to_string(), sq.value(i).to_string()));
-            organism.push(org.is_valid(i).then(|| org.value(i).to_string()));
+            if !quotas.is_empty() {
+                organism.push(org.is_valid(i).then(|| org.value(i).to_string()));
+            }
         }
     }
 

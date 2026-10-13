@@ -95,9 +95,10 @@ with a producer string, so an output knows what made it.
 
 Analytic stages have **no seed at all** — a digest is an exact expectation, not a sample. Sampled
 stages are **identity-keyed**, never sequence-keyed: `timsim-digest --max-peptides` (and its
-per-organism form) orders peptides by `splitmix64(peptide_id ^ seed)`, and the renderer's noise
-draws are seeded per `(precursor_id, peak_index)`. So adding an ion never reshuffles the others,
-and neither the thread count nor the size of the set changes any individual result.
+per-organism form) ranks peptides by `splitmix64(peptide_id ^ seed)`, and the renderer's noise
+draws are seeded per `(precursor_id, peak_index)`. So adding an ion never reshuffles the others: a
+peptide keeps its rank and an ion its draws whatever else is in the set (a cap still keeps only the
+top ranks, so a newcomer can displace one), and the thread count changes nothing.
 
 ## Driven by necroflow
 
