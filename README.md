@@ -29,7 +29,7 @@ cargo build --release --features sciex     # + timsim-render-sciex
 | binary | feature | what it does |
 |---|---|---|
 | `timsim-proteome` | *default* | FASTA (or a multi-source spec with organism tags + contaminants — this is how HYE works) → the protein universe. Structure only, no amounts. |
-| `timsim-digest` | *default* | Proteome → peptides + occurrences + cleavage sites. **Analytic** (an exact expectation, no seed); opt-in `--max-peptides` draws a seeded sample instead. |
+| `timsim-digest` | *default* | Proteome → peptides + occurrences + cleavage sites. **Analytic** (an exact expectation, no seed); opt-in `--max-peptides` draws a seeded sample instead, `--max-peptides-per-organism` one per organism (a HYE mix). |
 | `timsim-modify` | *default* | Peptides → **modforms**, driven by per-site **occupancy** (the chemist's measurable number) rather than a search engine's variable-mod combinatorics. Also emits the modification spec that `timsim-yield` reads, so the two stages cannot disagree about which mods block trypsin. |
 | `timsim-design` | *default* | Proteome + `design.toml` → samples, runs, sample↔run map, protein quantities. You specify a **mixture**; fold changes are derived, not typed in. |
 | `timsim-yield` | *default* | Shared structure + one sample's protein amounts → peptide amounts. `--digestion-efficiency` and `--cleavage-p` are the same parameter under two vocabularies. |
@@ -94,10 +94,10 @@ with a producer string, so an output knows what made it.
 ## Determinism
 
 Analytic stages have **no seed at all** — a digest is an exact expectation, not a sample. Sampled
-stages are **identity-keyed**, never sequence-keyed: `timsim-digest --max-peptides` orders peptides
-by `splitmix64(peptide_id ^ seed)`, and the renderer's noise draws are seeded per
-`(precursor_id, peak_index)`. So adding an ion never reshuffles the others, and neither the thread
-count nor the size of the set changes any individual result.
+stages are **identity-keyed**, never sequence-keyed: `timsim-digest --max-peptides` (and its
+per-organism form) orders peptides by `splitmix64(peptide_id ^ seed)`, and the renderer's noise
+draws are seeded per `(precursor_id, peak_index)`. So adding an ion never reshuffles the others,
+and neither the thread count nor the size of the set changes any individual result.
 
 ## Driven by necroflow
 
